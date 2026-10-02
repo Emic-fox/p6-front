@@ -1,0 +1,9 @@
+name: olympic-games
+services:
+  olympic-games-starter:
+    build: .
+    image: olympic-games-starter
+    container_name: olympic-games-starter
+    ports:
+      - "80:80"
+    restart: unless-stopped
