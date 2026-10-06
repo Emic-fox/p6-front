@@ -103,8 +103,9 @@ run_npm_tests() {
 
   # Installation reproductible des dépendances (cf. README : `npm ci` en CI).
   if [[ ! -d "$PROJECT_DIR/node_modules" ]]; then
-    log "npm : npm ci --cache .npm --prefer-offline"
-    ( cd "$PROJECT_DIR" && npm ci --cache .npm --prefer-offline )
+    # Cache npm par défaut (~/.npm) : c'est celui que restaure `cache: npm` de setup-node.
+    log "npm : npm ci --prefer-offline"
+    ( cd "$PROJECT_DIR" && npm ci --prefer-offline )
     if [[ $? -ne 0 ]]; then
       fail "$EX_DEPENDENCY" "Échec de 'npm ci'."
     fi

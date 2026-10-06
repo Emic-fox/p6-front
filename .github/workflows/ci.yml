@@ -1,0 +1,73 @@
+# Workflow CI générique : même fichier pour le back-end Java (Gradle)
+# et le front-end Angular (npm). Le type de projet est détecté à l'exécution.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Détection du type de projet
+        id: project
+        run: |
+          if [ -f gradlew ]; then echo "type=gradle" >> "$GITHUB_OUTPUT"
+          elif [ -f package.json ]; then echo "type=npm" >> "$GITHUB_OUTPUT"
+          else echo "::error::Type de projet non reconnu"; exit 1
+          fi
+
+      # Java (back-end) : JDK 21 + cache Gradle
+      - uses: actions/setup-java@v4
+        if: steps.project.outputs.type == 'gradle'
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      # Angular (front-end) : Node + cache npm
+      - uses: actions/setup-node@v4
+        if: steps.project.outputs.type == 'npm'
+        with:
+          node-version: "20.19"
+          cache: npm
+
+      # Lance les tests selon le type de projet, rapports JUnit dans test-results/
+      - name: Exécution des tests
+        run: bash ./run-tests.sh
+
+      # Affiche un résumé directement sur la page du run
+      # Les attributs JUnit diffèrent selon l'outil : Gradle écrit
+      # tests/skipped/failures/errors, karma-junit-reporter tests/errors/failures (sans skipped).
+      - name: Résumé des tests (Gradle)
+        if: always() && steps.project.outputs.type == 'gradle' # Même si les tests échouent
+        run: |
+          echo "## Résultats des tests" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -ho 'tests="[0-9]*" skipped="[0-9]*" failures="[0-9]*" errors="[0-9]*"' \
+            test-results/*.xml >> "$GITHUB_STEP_SUMMARY" \
+            || echo "Aucun rapport trouvé" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Résumé des tests (npm)
+        if: always() && steps.project.outputs.type == 'npm' # Même si les tests échouent
+        run: |
+          echo "## Résultats des tests" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -ho 'tests="[0-9]*" errors="[0-9]*" failures="[0-9]*"' \
+            test-results/*.xml >> "$GITHUB_STEP_SUMMARY" \
+            || echo "Aucun rapport trouvé" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Archivage du rapport de tests
+        if: always() # Même si les tests échouent
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results/

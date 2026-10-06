@@ -41,7 +41,6 @@ testem.log
 .DS_Store
 Thumbs.db
 
-# Artefacts de tests / cache npm (run-tests.sh)
-/.npm
+# Artefacts de tests (run-tests.sh)
 /reports
 /test-results
