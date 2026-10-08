@@ -5,6 +5,12 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Créer une release"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -76,7 +82,7 @@ jobs:
   # (suit https://docs.github.com/en/actions/publishing-packages/publishing-docker-images)
   build:
     needs: test # Pas de publication si les tests échouent
-    if: github.event_name == 'push' # Pas de publication depuis les pull requests
+    if: github.event_name != 'pull_request' # Publication au push ou en manuel
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -121,3 +127,60 @@ jobs:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+
+  # Crée la version (tag vX.Y.Z + release GitHub avec changelog) à partir
+  # des commits Conventional Commits, puis ajoute ce numéro de version à l'image construite.
+  # Configuration : .releaserc.json
+  release:
+    needs: build
+    # Sur main uniquement : à chaque push, ou manuellement si la case "Créer une release" est cochée
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || inputs.release)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to be able to publish a GitHub release
+      issues: write # to be able to comment on released issues
+      pull-requests: write # to be able to comment on released pull requests
+      packages: write # to be able to add tags to the Docker image
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+
+      - name: Install semantic-release
+        run: npm install -g semantic-release@25 @semantic-release/git@11 @semantic-release/exec@7
+
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx semantic-release
+
+      # Si une version a été publiée, le commit courant porte son tag (ex: v1.2.3)
+      - name: Récupération de la version publiée
+        id: version
+        run: echo "version=$(git tag --points-at HEAD | sed 's/^v//')" >> "$GITHUB_OUTPUT"
+
+      - name: Connexion au GitHub Container Registry
+        if: steps.version.outputs.version != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Ajoute le tag 1.2.3 à l'image construite par le job build (tag sha-xxxxxxx), sans la reconstruire.
+      - name: Tag de l'image avec la version
+        if: steps.version.outputs.version != ''
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          IMAGE="${IMAGE,,}"
+          docker buildx imagetools create -t "$IMAGE:$VERSION" "$IMAGE:sha-${GITHUB_SHA::7}"
