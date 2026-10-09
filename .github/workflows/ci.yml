@@ -1,0 +1,186 @@
+# Workflow CI générique : même fichier pour le back-end Java (Gradle)
+# et le front-end Angular (npm). Le type de projet est détecté à l'exécution.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Créer une release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Détection du type de projet
+        id: project
+        run: |
+          if [ -f gradlew ]; then echo "type=gradle" >> "$GITHUB_OUTPUT"
+          elif [ -f package.json ]; then echo "type=npm" >> "$GITHUB_OUTPUT"
+          else echo "::error::Type de projet non reconnu"; exit 1
+          fi
+
+      # Java (back-end) : JDK 21 + cache Gradle
+      - uses: actions/setup-java@v4
+        if: steps.project.outputs.type == 'gradle'
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      # Angular (front-end) : Node + cache npm
+      - uses: actions/setup-node@v4
+        if: steps.project.outputs.type == 'npm'
+        with:
+          node-version: "20.19"
+          cache: npm
+
+      # Lance les tests selon le type de projet, rapports JUnit dans test-results/
+      - name: Exécution des tests
+        run: bash ./run-tests.sh
+
+      # Affiche un résumé directement sur la page du run
+      # Les attributs JUnit diffèrent selon l'outil : Gradle écrit
+      # tests/skipped/failures/errors, karma-junit-reporter tests/errors/failures (sans skipped).
+      - name: Résumé des tests (Gradle)
+        if: always() && steps.project.outputs.type == 'gradle' # Même si les tests échouent
+        run: |
+          echo "## Résultats des tests" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -ho 'tests="[0-9]*" skipped="[0-9]*" failures="[0-9]*" errors="[0-9]*"' \
+            test-results/*.xml >> "$GITHUB_STEP_SUMMARY" \
+            || echo "Aucun rapport trouvé" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Résumé des tests (npm)
+        if: always() && steps.project.outputs.type == 'npm' # Même si les tests échouent
+        run: |
+          echo "## Résultats des tests" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -ho 'tests="[0-9]*" errors="[0-9]*" failures="[0-9]*"' \
+            test-results/*.xml >> "$GITHUB_STEP_SUMMARY" \
+            || echo "Aucun rapport trouvé" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Archivage du rapport de tests
+        if: always() # Même si les tests échouent
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results/
+
+  # Construit l'image Docker et la publie sur le GitHub Container Registry
+  # (suit https://docs.github.com/en/actions/publishing-packages/publishing-docker-images)
+  build:
+    needs: test # Pas de publication si les tests échouent
+    if: github.event_name != 'pull_request' # Publication au push ou en manuel
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Connexion au GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tags : nom de la branche (ex: main) et SHA du commit (ex: sha-a1b2c3d)
+      - name: Extraction des métadonnées Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha
+
+      - name: Construction et publication de l'image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Génération de l'attestation de provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  # Crée la version (tag vX.Y.Z + release GitHub avec changelog) à partir
+  # des commits Conventional Commits, puis ajoute ce numéro de version à l'image construite.
+  # Configuration : .releaserc.json
+  release:
+    needs: build
+    # Sur main uniquement : à chaque push, ou manuellement si la case "Créer une release" est cochée
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || inputs.release)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to be able to publish a GitHub release
+      issues: write # to be able to comment on released issues
+      pull-requests: write # to be able to comment on released pull requests
+      packages: write # to be able to add tags to the Docker image
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+
+      - name: Install semantic-release
+        run: npm install -g semantic-release@25 @semantic-release/git@11 @semantic-release/exec@7
+
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx semantic-release
+
+      # Si une version a été publiée, le commit courant porte son tag (ex: v1.2.3)
+      - name: Récupération de la version publiée
+        id: version
+        run: echo "version=$(git tag --points-at HEAD | sed 's/^v//')" >> "$GITHUB_OUTPUT"
+
+      - name: Connexion au GitHub Container Registry
+        if: steps.version.outputs.version != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Ajoute le tag 1.2.3 à l'image construite par le job build (tag sha-xxxxxxx), sans la reconstruire.
+      - name: Tag de l'image avec la version
+        if: steps.version.outputs.version != ''
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          IMAGE="${IMAGE,,}"
+          docker buildx imagetools create -t "$IMAGE:$VERSION" "$IMAGE:sha-${GITHUB_SHA::7}"
